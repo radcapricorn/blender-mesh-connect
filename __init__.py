@@ -50,13 +50,13 @@ def calc_face(face, keep_caps=True):
             if not loop.edge.tag:
                 loop.edge.tag = True
                 self_selected = True
-                
+
             adjacent_face = radial_loop.face
-            # Only walk adjacent face if current face tagged the edge                
+            # Only walk adjacent face if current face tagged the edge
             if adjacent_face.tag and self_selected:
                 result += calc_face(adjacent_face, keep_caps)
 
-        if loop.edge.tag: 
+        if loop.edge.tag:
             (selected, to_select)[self_selected].append(loop)
 
     for loop in to_select:
@@ -91,8 +91,6 @@ def get_edge_rings(bm, keep_caps=True):
         for face in selected_faces:
             face.tag = False
             for edge in face.edges: edge.tag = False
-            
-    print(edges)
 
     return edges
 
@@ -128,10 +126,10 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
             for edge in edges:
                 edge.select = True
             context.tool_settings.mesh_select_mode[:] = False, True, False
-            
+
         finally:
             bmesh_release(bm, object)
-            
+
         return {'FINISHED'}
 
 class MESH_xOT_cut_faces(bpy.types.Operator):
@@ -197,33 +195,33 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
 
             bpy.ops.mesh.select_all(action='DESELECT')
             bm.select_mode = {'EDGE'}
-            
+
             inner = result['geom_inner']
             for edge in filter(lambda e: isinstance(e, bmesh.types.BMEdge), inner):
                 edge.select = True
 
         finally:
             bmesh_release(bm, object)
-            
+
         return True
-            
+
     def execute(self, context):
-        
+
         if not self.cut_edges(context):
             return {'CANCELLED'}
-        
-        context.tool_settings.mesh_select_mode[:] = False, True, False        
+
+        context.tool_settings.mesh_select_mode[:] = False, True, False
         # Try to select all possible loops
         bpy.ops.mesh.loop_multi_select(ring=False)
         return {'FINISHED'}
 
 def menu_deselect_boundary(self, context):
     self.layout.operator(MESH_xOT_deselect_boundary.bl_idname)
-    
+
 def menu_cut_faces(self, context):
     self.layout.operator(MESH_xOT_cut_faces.bl_idname)
 
-def register():   
+def register():
     bpy.utils.register_class(MESH_xOT_deselect_boundary)
     bpy.utils.register_class(MESH_xOT_cut_faces)
 
@@ -231,7 +229,7 @@ def register():
         bpy.types.VIEW3D_MT_select_edit_mesh.append(menu_deselect_boundary)
         bpy.types.VIEW3D_MT_edit_mesh_faces.append(menu_cut_faces)
 
-def unregister():   
+def unregister():
     bpy.utils.unregister_class(MESH_xOT_deselect_boundary)
     bpy.utils.unregister_class(MESH_xOT_cut_faces)
 
