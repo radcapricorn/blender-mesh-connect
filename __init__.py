@@ -27,9 +27,7 @@ def bmesh_release(bm, object):
         bm.to_mesh(mesh)
         bm.free()
 
-def calc_face(face, keep_caps=True):
-
-    assert face.tag
+def face_adjacent_selected_edges(face, tags, keep_caps=True):
 
     def radial_loops(loop):
         next = loop.link_loop_radial_next
@@ -38,60 +36,48 @@ def calc_face(face, keep_caps=True):
             yield result
 
     result = []
-
-    face.tag = False
     selected = []
-    to_select = []
+
     for loop in face.loops:
-        self_selected = False
+        old_tag = loop.edge[tags]
         # Iterate over selected adjacent faces
         for radial_loop in filter(lambda l: l.face.select, radial_loops(loop)):
-            # Tag the edge if no other face done so already
-            if not loop.edge.tag:
-                loop.edge.tag = True
-                self_selected = True
+            loop.edge[tags] += 1
 
-            adjacent_face = radial_loop.face
-            # Only walk adjacent face if current face tagged the edge
-            if adjacent_face.tag and self_selected:
-                result += calc_face(adjacent_face, keep_caps)
+        new_tag = loop.edge[tags]
 
-        if loop.edge.tag:
-            (selected, to_select)[self_selected].append(loop)
-
-    for loop in to_select:
-        result.append(loop.edge)
-        selected.append(loop)
+        if new_tag:
+            # No one else has tagged this edge?
+            if not old_tag:
+                result.append(loop.edge.index)
+            selected.append(loop)
 
     # Select opposite edge in quads
     if keep_caps and len(selected) == 1 and len(face.verts) == 4:
-        result.append(selected[0].link_loop_next.link_loop_next.edge)
+        result.append(selected[0].link_loop_next.link_loop_next.edge.index)
 
     return result
 
-def get_edge_rings(bm, keep_caps=True):
+def get_edge_rings(bm, faces, keep_caps=True):
 
-    def tag_face(face):
-        if face.select:
-            face.tag = True
-            for edge in face.edges: edge.tag = False
-        return face.select
-
-    # fetch selected faces while setting up tags
-    selected_faces = [ f for f in bm.faces if tag_face(f) ]
+    # Make sure we're dealing with valid indices
+    bm.edges.index_update()
+    tags = bm.edges.layers.int.new("etl_data")
 
     edges = []
 
     try:
-        # generate a list of edges to select:
-        # traversing only tagged faces, since calc_face can walk and untag islands
-        for face in filter(lambda f: f.tag, selected_faces): edges += calc_face(face, keep_caps)
+        # generate a list of edges to select
+        for face in faces: edges += face_adjacent_selected_edges(face, tags, keep_caps)
     finally:
-        # housekeeping: clear tags
-        for face in selected_faces:
-            face.tag = False
-            for edge in face.edges: edge.tag = False
+        # housekeeping: remove our custom data
+        bm.edges.layers.int.remove(tags)
+        # Removing custom data modifies the contents of bm.edges,
+        # so we need to update lookup table
+        bm.edges.ensure_lookup_table()
 
+    # Convert from indices to edges
+    edges[:] = [ bm.edges[i] for i in edges ]
     return edges
 
 class MESH_xOT_deselect_boundary(bpy.types.Operator):
@@ -115,7 +101,8 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
         bm = bmesh_from_object(object)
 
         try:
-            edges = get_edge_rings(bm, keep_caps = self.keep_cap_edges)
+            faces = [ face for face in bm.faces if face.select ]
+            edges = get_edge_rings(bm, faces, keep_caps = self.keep_cap_edges)
             if not edges:
                 self.report({'WARNING'}, "No suitable selection found")
                 return {'CANCELLED'}
@@ -126,9 +113,11 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
             for edge in edges:
                 edge.select = True
             context.tool_settings.mesh_select_mode[:] = False, True, False
-
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
         finally:
             bmesh_release(bm, object)
+            pass
 
         return {'FINISHED'}
 
@@ -180,7 +169,8 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
         bm = bmesh_from_object(object)
 
         try:
-            edges = get_edge_rings(bm, keep_caps = True)
+            faces = [ face for face in bm.faces if face.select ]
+            edges = get_edge_rings(bm, faces, keep_caps = True)
             if not edges:
                 self.report({'WARNING'}, "No suitable selection found")
                 return False
@@ -199,7 +189,8 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
             inner = result['geom_inner']
             for edge in filter(lambda e: isinstance(e, bmesh.types.BMEdge), inner):
                 edge.select = True
-
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
         finally:
             bmesh_release(bm, object)
 
