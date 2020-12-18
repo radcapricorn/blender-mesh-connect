@@ -1,13 +1,14 @@
 bl_info = {
-    "name" : "Cut Faces",
+    "name" : "Connect",
     "author" : "Stanislav Blinov",
-    "version" : (1, 0, 0),
-    "blender" : (2, 72, 0),
-    "description" : "Cut Faces and Deselect Boundary operators",
+    "version" : (1, 1, 0),
+    "blender" : (2, 80, 0),
+    "description" : "Connect and Deselect Boundary operators",
     "category" : "Mesh",}
 
 import bpy
 import bmesh
+from bmesh.types import BMEdge, BMVert
 
 def bmesh_from_object(object):
     mesh = object.data
@@ -27,58 +28,46 @@ def bmesh_release(bm, object):
         bm.to_mesh(mesh)
         bm.free()
 
-def face_adjacent_selected_edges(face, tags, keep_caps=True):
+def radial_loops(loop):
+    next = loop.link_loop_radial_next
+    while next != loop:
+        result, next = next, next.link_loop_radial_next
+        yield result
 
-    def radial_loops(loop):
-        next = loop.link_loop_radial_next
-        while next != loop:
-            result, next = next, next.link_loop_radial_next
-            yield result
+def walk_loops(loop):
+    next = loop.link_loop_next
+    while next != loop:
+        result, next = next, next.link_loop_next
+        yield result
 
-    result = []
-    selected = []
-
-    for loop in face.loops:
-        old_tag = loop.edge[tags]
-        # Iterate over selected adjacent faces
-        for radial_loop in filter(lambda l: l.face.select, radial_loops(loop)):
-            loop.edge[tags] += 1
-
-        new_tag = loop.edge[tags]
-
-        if new_tag:
-            # No one else has tagged this edge?
-            if not old_tag:
-                result.append(loop.edge.index)
-            selected.append(loop)
-
-    # Select opposite edge in quads
-    if keep_caps and len(selected) == 1 and len(face.verts) == 4:
-        result.append(selected[0].link_loop_next.link_loop_next.edge.index)
-
+def loop_distance(lfrom, lto):
+    result = 0
+    while lfrom != lto:
+        lfrom = lfrom.link_loop_next
+        result += 1
     return result
 
-def get_edge_rings(bm, faces, keep_caps=True):
+def get_inner_selected_edges(edges, keep_caps = True):
+    result = [None] * len(edges)
+    count = 0
 
-    # Make sure we're dealing with valid indices
-    bm.edges.index_update()
-    tags = bm.edges.layers.int.new("etl_data")
-
-    edges = []
-
-    try:
-        # generate a list of edges to select
-        for face in faces: edges += face_adjacent_selected_edges(face, tags, keep_caps)
-    finally:
-        # housekeeping: remove our custom data
-        bm.edges.layers.int.remove(tags)
-        # Removing custom data modifies the contents of bm.edges,
-        # so we need to update lookup table
-        bm.edges.ensure_lookup_table()
-
-    # Convert from indices to edges
-    edges[:] = [ bm.edges[i] for i in edges ]
-    return edges
+    for e in edges:
+        num_sel_faces = sum(l.face.select for l in e.link_loops)
+        if num_sel_faces > 1:
+            # if more than one adjacent face is selected, done, keep edge
+            result[count] = e
+            count += 1
+        elif num_sel_faces == 1 and keep_caps:
+            (loop,) = (l for l in e.link_loops if l.face.select)
+            rank = len(loop.face.verts)
+            # only keep this edge if the only other selected face adjacent to this one
+            # is over the opposite edge; opposite edges are only defined in even n-gons
+            if not rank & 1:
+                adj_sel_faces = set(c for c in walk_loops(loop) for l in radial_loops(c) if l.face.select)
+                if len(adj_sel_faces) == 1 and loop_distance(loop, next(iter(adj_sel_faces))) == (rank >> 1):
+                    result[count] = e
+                    count += 1
+    return result[:count]
 
 class MESH_xOT_deselect_boundary(bpy.types.Operator):
     """Deselect boundary edges of selected faces"""
@@ -86,7 +75,7 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
     bl_label = "Deselect Boundary"
     bl_options = {'REGISTER', 'UNDO'}
 
-    keep_cap_edges = bpy.props.BoolProperty(
+    keep_cap_edges: bpy.props.BoolProperty(
         name        = "Keep Cap Edges",
         description = "Keep quad strip cap edges selected",
         default     = False)
@@ -101,10 +90,8 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
         bm = bmesh_from_object(object)
 
         try:
-            faces = [ face for face in bm.faces if face.select ]
-            edges = get_edge_rings(bm, faces, keep_caps = self.keep_cap_edges)
+            edges = get_inner_selected_edges([e for e in bm.edges if e.select], keep_caps = self.keep_cap_edges)
             if not edges:
-                self.report({'WARNING'}, "No suitable selection found")
                 return {'CANCELLED'}
 
             bpy.ops.mesh.select_all(action='DESELECT')
@@ -121,10 +108,10 @@ class MESH_xOT_deselect_boundary(bpy.types.Operator):
 
         return {'FINISHED'}
 
-class MESH_xOT_cut_faces(bpy.types.Operator):
-    """Cut selected faces, connecting through their adjacent edges"""
-    bl_idname = "mesh.ext_cut_faces"
-    bl_label = "Cut Faces"
+class MESH_xOT_connect(bpy.types.Operator):
+    """Cut selected faces, connecting through their adjacent edges; or cut through selected edge rings"""
+    bl_idname = "mesh.ext_connect"
+    bl_label = "Connect"
     bl_options = {'REGISTER', 'UNDO'}
 
     # from bmesh_operators.h
@@ -133,28 +120,28 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
     SUBD_FAN          = 2
     SUBD_STRAIGHT_CUT = 3
 
-    num_cuts = bpy.props.IntProperty(
+    num_cuts: bpy.props.IntProperty(
         name    = "Number of Cuts",
         default = 1,
         min     = 1,
         max     = 100,
         subtype = 'UNSIGNED')
 
-    use_single_edge = bpy.props.BoolProperty(
-        name        = "Quad/Tri Mode",
-        description = "Cut boundary faces",
-        default     = False)
+    use_single_edge: bpy.props.BoolProperty(
+        name        = "Boundary n-gons",
+        description = "Create n-gons on selection boundary",
+        default     = True)
 
-    corner_type = bpy.props.EnumProperty(
-        items = [('SUBD_INNERVERT', "Inner Vert", ""),
-                 ('SUBD_PATH', "Path", ""),
-                 ('SUBD_FAN', "Fan", ""),
-                 ('SUBD_STRAIGHT_CUT', "Straight Cut", ""),],
+    corner_type: bpy.props.EnumProperty(
+        items = [('INNER_VERT', "Inner Vert", ""),
+                 ('PATH', "Path", ""),
+                 ('FAN', "Fan", ""),
+                 ('STRAIGHT_CUT', "Straight Cut", ""),],
         name = "Quad Corner Type",
         description = "How to subdivide quad corners",
-        default = 'SUBD_STRAIGHT_CUT')
+        default = 'STRAIGHT_CUT')
 
-    use_grid_fill = bpy.props.BoolProperty(
+    use_grid_fill: bpy.props.BoolProperty(
         name        = "Use Grid Fill",
         description = "Fill fully enclosed faces with a grid",
         default     = True)
@@ -169,10 +156,12 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
         bm = bmesh_from_object(object)
 
         try:
-            faces = [ face for face in bm.faces if face.select ]
-            edges = get_edge_rings(bm, faces, keep_caps = True)
+            edges = [e for e in bm.edges if e.select]
+            if context.tool_settings.mesh_select_mode[2]:
+                edges = get_inner_selected_edges(edges, keep_caps = True)
+            else:
+                edges = [e for e in edges if sum(l.edge.select for loop in e.link_loops for l in walk_loops(loop)) > 0]
             if not edges:
-                self.report({'WARNING'}, "No suitable selection found")
                 return False
 
             result = bmesh.ops.subdivide_edges(
@@ -180,14 +169,17 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
                 edges = edges,
                 cuts = int(self.num_cuts),
                 use_grid_fill = bool(self.use_grid_fill),
-                use_single_edge = bool(self.use_single_edge),
-                quad_corner_type = eval("self."+self.corner_type))
+                use_single_edge = not bool(self.use_single_edge),
+                quad_corner_type = str(self.corner_type))
 
             bpy.ops.mesh.select_all(action='DESELECT')
             bm.select_mode = {'EDGE'}
 
-            inner = result['geom_inner']
-            for edge in filter(lambda e: isinstance(e, bmesh.types.BMEdge), inner):
+            # For some reason, not all edges are reported in 'geom_inner', so instead,
+            # select all edges linked to vertices in 'geom_inner', that do not also belong to 'geom_split' edges
+            split_edges = set(e for e in result['geom_split'] if isinstance(e, BMEdge))
+            inner_edges = set(e for v in result['geom_inner'] if isinstance(v, BMVert) for e in v.link_edges)
+            for edge in inner_edges.difference(split_edges):
                 edge.select = True
         except Exception as error:
             self.report({'ERROR'}, str(error))
@@ -202,31 +194,26 @@ class MESH_xOT_cut_faces(bpy.types.Operator):
             return {'CANCELLED'}
 
         context.tool_settings.mesh_select_mode[:] = False, True, False
-        # Try to select all possible loops
-        bpy.ops.mesh.loop_multi_select(ring=False)
         return {'FINISHED'}
 
 def menu_deselect_boundary(self, context):
     self.layout.operator(MESH_xOT_deselect_boundary.bl_idname)
 
-def menu_cut_faces(self, context):
-    self.layout.operator(MESH_xOT_cut_faces.bl_idname)
+def menu_connect(self, context):
+    self.layout.operator(MESH_xOT_connect.bl_idname)
 
 def register():
     bpy.utils.register_class(MESH_xOT_deselect_boundary)
-    bpy.utils.register_class(MESH_xOT_cut_faces)
+    bpy.utils.register_class(MESH_xOT_connect)
 
-    if __name__ != "__main__":
-        bpy.types.VIEW3D_MT_select_edit_mesh.append(menu_deselect_boundary)
-        bpy.types.VIEW3D_MT_edit_mesh_faces.append(menu_cut_faces)
+    bpy.types.VIEW3D_MT_select_edit_mesh.append(menu_deselect_boundary)
+    bpy.types.VIEW3D_MT_edit_mesh_edges.append(menu_connect)
+    bpy.types.VIEW3D_MT_edit_mesh_faces.append(menu_connect)
 
 def unregister():
     bpy.utils.unregister_class(MESH_xOT_deselect_boundary)
-    bpy.utils.unregister_class(MESH_xOT_cut_faces)
+    bpy.utils.unregister_class(MESH_xOT_connect)
 
-    if __name__ != "__main__":
-        bpy.types.VIEW3D_MT_select_edit_mesh.remove(menu_deselect_boundary)
-        bpy.types.VIEW3D_MT_edit_mesh_faces.remove(menu_cut_faces)
-
-if __name__ == "__main__":
-    register()
+    bpy.types.VIEW3D_MT_select_edit_mesh.remove(menu_deselect_boundary)
+    bpy.types.VIEW3D_MT_edit_mesh_faces.remove(menu_connect)
+    bpy.types.VIEW3D_MT_edit_mesh_edges.remove(menu_connect)
